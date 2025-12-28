@@ -1,21 +1,30 @@
 /*
-注意事项：
-1.延迟初始化 SwsContext：必须在 avcodec_receive_frame 
-    成功拿到了第一帧（此时 frame->width 等才有效）之后，再初始化转换上下文。
-2.输出 Frame 缓冲区的分配：确保 out_frame 的缓冲区在使用前已经分配好。
-3.wsl2G 内需要先设置好环境变量 ：
-    export SDL_AUDIO_DRIVER=pulseaudio
-    原因分析：
-    1. WSL2 的音频桥接：WSL2 (WSLg) 主要是通过一个透明的 PulseAudio 桥接器将声音传送到 Windows 宿主机的。Windows
-      会在后台运行一个专为 WSL 优化的 PulseAudio 服务。
-    2. SDL3 的驱动优先级：在 Fedora 实体机上，PipeWire 是现代的标准音频服务器，SDL3 默认会优先尝试使用 pipewire
-      驱动，并且能够完美工作。
-    3. WSL2 中的冲突：在 WSL2 的 Fedora 中，可能安装了 PipeWire 的库，导致 SDL3 误以为可以使用 pipewire 驱动。但由于 WSL2
-      的环境特殊性，PipeWire 守护进程可能没有正确配置或者无法直接桥接到 Windows 的音频输出，导致数据虽然发出了（Queue
-      在增加），但没有被底层的音频服务器真正消费。
-    4. PulseAudio 的稳定性：WSLg 对 PulseAudio 的支持是最成熟的。当你强制指定 SDL_AUDIO_DRIVER=pulseaudio 时，SDL3 会绕过
-      PipeWire 直连 WSLg 的 PulseAudio 代理，从而正常播放。
+注意事项与关键修复总结：
 
+1. WSL2/WSLg 音频驱动兼容性：
+   - 现象：在 WSL2 Fedora 上默认无声，但在实体机正常。
+   - 原因：WSLg 通过 PulseAudio 协议桥接音频到 Windows。虽然 Fedora 安装了 PipeWire，但其与 WSLg 的桥接可能不完整，导致 SDL3 默认选择 pipewire 驱动时数据无法消费。
+   - 解决：强制指定 `export SDL_AUDIO_DRIVER=pulseaudio`，使 SDL3 直接使用 PulseAudio 后端。
+
+2. 音频刺啦声/爆音修复：
+   - 错误1：在开始播放时调用 `SDL_FlushAudioStream`，导致首帧音频数据被丢弃，产生初始爆音。 -> 已移除。
+   - 错误2：当 SDL 音频队列满时，直接 `break` 跳出解码循环，导致当前解码出的音频帧后续数据丢失。 -> 改为 `while` 循环等待 (`SDL_Delay`)，直到队列有空间，保证数据完整性。
+   - 错误3：SwrContext 初始化使用了 `adec_ctx` 的静态参数。 -> 改为根据 `frame` 的实际参数动态初始化/重建 SwrContext，防止因 MP3/AAC 头信息不准导致的重采样错误。
+
+3. 音画同步 (AV Sync) 策略：
+   - 策略：以音频时钟为主时钟 (Master Audio Clock)。
+   - 实现：
+     - 全局维护 `audio_clock`，记录最新写入 SDL 的音频帧的 PTS。
+     - 在视频渲染时，计算当前“实际听到”的声音时间：`CurrentAudioTime = audio_clock - (SDL_Buffered_Bytes / BytesPerSec)`。
+     - 计算视频与音频的时间差：`diff = VideoPTS - CurrentAudioTime`。
+     - 如果 `diff > 0` (视频快了)，则睡眠 `diff` 时间等待音频；如果 `diff < 0` (视频慢了)，则立即渲染追赶。
+   - 效果：解决了旧代码中使用 `SDL_Delay(1000/fps)` 导致的累积误差和长视频音画不同步问题。
+
+4. 延迟初始化 SwsContext：
+   - 必须在 avcodec_receive_frame 成功拿到第一帧（此时 frame->width 等才有效）之后，再初始化视频转换上下文。
+
+5. 输出 Frame 缓冲区的分配：
+   - 确保 out_frame 的缓冲区在使用前已经分配好 (av_frame_get_buffer)。
 */
 #include "libavutil/rational.h"
 #include <SDL3/SDL_render.h>
@@ -188,13 +197,14 @@ int init_ffmpeg(const std::string filename) {
 
 
 
+static double audio_clock = 0; // 记录最新写入音频数据的 PTS
+
 void decode_video_render_loop() {
     while (true)
     { 
         ret = avcodec_receive_frame(vdec_ctx, frame);
         if(ret == 0) {
             // 处理视频帧
-            // 3. 确保 out_frame 的缓冲区是分配好的
             if(out_frame->data[0] == nullptr) {
                 out_frame->width = 800;
                 out_frame->height = 600;
@@ -206,7 +216,7 @@ void decode_video_render_loop() {
                 }
                 log_error("Allocated output frame buffer", ret);
             }
-            // 视频格式转换 (SwScale)
+            // 视频格式转换
             sws_ctx = sws_getCachedContext(sws_ctx, frame->width, frame->height,
                                     (AVPixelFormat)frame->format, out_frame->width, out_frame->height,
                                     AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
@@ -218,6 +228,37 @@ void decode_video_render_loop() {
 
             sws_scale(sws_ctx, frame->data, frame->linesize, 0, frame->height, out_frame->data,
                                       out_frame->linesize);
+            
+            // --- 音画同步 (AV Sync) 核心逻辑 ---
+            double video_pts = 0;
+            if (frame->pts != AV_NOPTS_VALUE) {
+                video_pts = frame->pts * av_q2d(fmt_ctx->streams[video_idx]->time_base);
+            } else {
+                frame->pts = 0; // Fallback
+            }
+
+            // 计算当前音频播放到了哪个时间点 (Master Clock)
+            // 公式：最新写入的音频PTS - 还在缓冲区里排队没播放的时间
+            double bytes_per_sec = 44100 * 2 * 2; // 默认值防除零
+            if (adec_ctx && adec_ctx->sample_rate > 0) {
+                bytes_per_sec = (double)adec_ctx->sample_rate * out_ch_layout.nb_channels * av_get_bytes_per_sample(AV_SAMPLE_FMT_S16);
+            }
+            
+            double buffered_time = 0;
+            if (audio_stream && bytes_per_sec > 0) {
+                buffered_time = SDL_GetAudioStreamQueued(audio_stream) / bytes_per_sec;
+            }
+            
+            double current_audio_time = audio_clock - buffered_time;
+            double diff = video_pts - current_audio_time;
+
+            // 如果视频比音频快 (diff > 0)，视频就要等音频赶上来
+            // 如果视频比音频慢 (diff < 0)，视频就应该立即播放 (不 sleep) 甚至丢帧(这里暂未实现丢帧)
+            if (diff > 0 && diff < 10.0) { // 阈值 10秒防止跳变
+                SDL_Delay((Uint32)(diff * 1000));
+            }
+            // ------------------------------------
+
             av_frame_unref(frame);
             // 复制数据到像素缓冲区
             SDL_UpdateTexture(texture, NULL, out_frame->data[0], out_frame->linesize[0]);
@@ -226,15 +267,11 @@ void decode_video_render_loop() {
             SDL_RenderTexture(renderer, texture, NULL, NULL);
             SDL_RenderPresent(renderer);
             
-            SDL_Delay( 1000 / (av_q2d(fmt_ctx->streams[video_idx]->avg_frame_rate)) );
             break; 
 
-            // 控制帧率
         } else if (ret == AVERROR(EAGAIN)) {
-            // 继续等待下一帧
             break;
         } else if (ret == AVERROR_EOF) {
-            // 播放结束
             break;
         } else {
             log_error("avcodec_receive_frame", ret);
@@ -242,11 +279,17 @@ void decode_video_render_loop() {
         }
     }
 }
-static int64_t total = 0;
-static bool audio_started = false;
 void decode_audio_loop()
 {
+    // 限制最大缓冲大小 (约1秒的数据: 48000 * 2ch * 2bytes ~= 192KB)
+    const int MAX_AUDIO_QUEUE_BYTES = 192000;
+
     while (true) {
+        // 1. 简单的流控：如果缓冲区太满，就等待，而不是丢弃数据
+        while (SDL_GetAudioStreamQueued(audio_stream) > MAX_AUDIO_QUEUE_BYTES) {
+            SDL_Delay(10); 
+        }
+
         int ret = avcodec_receive_frame(adec_ctx, frame);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
             break;
@@ -256,20 +299,55 @@ void decode_audio_loop()
             break;
         }
 
-        if (!swr_ctx) {
+        // 更新 Audio Clock
+        if (frame->pts != AV_NOPTS_VALUE) {
+            audio_clock = frame->pts * av_q2d(fmt_ctx->streams[audio_idx]->time_base);
+        }
+
+        // 2. 动态初始化/重建 SwrContext
+
+        // 2. 动态初始化/重建 SwrContext
+        // 必须使用 frame->sample_rate 而不是 adec_ctx->sample_rate，因为 frame 才是真实的
+        // 这里简化处理：如果 swr_ctx 不存在，或者输入格式发生了变化（虽然少见），则重新初始化
+        static int current_in_sample_rate = -1;
+        static AVSampleFormat current_in_sample_fmt = AV_SAMPLE_FMT_NONE;
+        static AVChannelLayout current_in_ch_layout; // Zero-initialized by default for static
+
+        bool format_changed = (frame->sample_rate != current_in_sample_rate) ||
+                              (frame->format != current_in_sample_fmt) ||
+                              (av_channel_layout_compare(&frame->ch_layout, &current_in_ch_layout) != 0);
+
+        if (!swr_ctx || format_changed) {
+            if (swr_ctx) {
+                swr_free(&swr_ctx);
+            }
+            
+            // 更新缓存的格式信息
+            current_in_sample_rate = frame->sample_rate;
+            current_in_sample_fmt = (AVSampleFormat)frame->format;
+            av_channel_layout_uninit(&current_in_ch_layout);
+            av_channel_layout_copy(&current_in_ch_layout, &frame->ch_layout);
+
             swr_ctx = swr_alloc();
-            swr_alloc_set_opts2(
+            
+            // 配置重采样器：输入取自 frame，输出取自我们需要的目标格式
+            int res = swr_alloc_set_opts2(
                 &swr_ctx,
-                &out_ch_layout,
-                AV_SAMPLE_FMT_S16,
-                adec_ctx->sample_rate,
-                &adec_ctx->ch_layout,
-                adec_ctx->sample_fmt,
-                adec_ctx->sample_rate,
+                &out_ch_layout,         // 目标通道布局 (Stereo)
+                AV_SAMPLE_FMT_S16,      // 目标采样格式 (S16)
+                frame->sample_rate,     // 目标采样率 (通常保持不变，或者也可以重采样)
+                &frame->ch_layout,      // 源通道布局 (从 Frame 获取)
+                (AVSampleFormat)frame->format, // 源采样格式 (从 Frame 获取)
+                frame->sample_rate,     // 源采样率 (从 Frame 获取)
                 0,
                 nullptr
             );
-            swr_init(swr_ctx);
+
+            if (res < 0 || swr_init(swr_ctx) < 0) {
+                std::cerr << "Failed to initialize SwrContext" << std::endl;
+                av_frame_unref(frame);
+                break;
+            }
         }
 
         int out_max_samples = swr_get_out_samples(swr_ctx, frame->nb_samples);
@@ -303,22 +381,14 @@ void decode_audio_loop()
                 * av_get_bytes_per_sample(AV_SAMPLE_FMT_S16);
 
             SDL_PutAudioStreamData(audio_stream, audio_out_buf, bytes);
-
-            if(!audio_started) {
-                SDL_FlushAudioStream(audio_stream);
-                audio_started = true;
-            }
+            // 移除了这里的 Flush 操作
         }
 
         av_frame_unref(frame);
-        total += out_samples;
-        //std::cout << "Total audio samples processed: " << total << std::endl;
-        SDL_AudioDeviceID dev = SDL_GetAudioStreamDevice(audio_stream);
-        //SDL_Log("Audio device id = %u", dev);
-        //SDL_Log("Queued audio = %d", SDL_GetAudioStreamQueued(audio_stream));
-
+        // 减少日志输出频率
+        // total += out_samples;
+        // std::cout << "Total audio samples processed: " << total << std::endl;
     }
-    
 }
 
 /* This function runs once at startup. */
